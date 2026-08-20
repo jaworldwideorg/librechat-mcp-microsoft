@@ -14,7 +14,6 @@ from mcp_microsoft.tools import calendar, mail, sharepoint, teams
             '"Denmark" AND ("LMS" OR "deployment")',
             '"Denmark" AND ("LMS" OR "deployment")',
         ),
-        ('subject:"quarterly report"', 'subject:"quarterly report"'),
         (
             '("Package" OR Platform OR service.example) AND (Region OR Org)',
             '("Package" OR Platform OR "service.example") AND (Region OR Org)',
@@ -40,6 +39,37 @@ async def test_search_emails_does_not_double_quote_kql(
 
     assert captured["path"] == "/me/messages"
     assert captured["params"]["$search"] == expected_graph_query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("search_input", "expected_filter"),
+    [
+        ('subject:"Quarterly report"', "contains(subject, 'Quarterly report')"),
+        ('SUBJECT:"Manager\'s update"', "contains(subject, 'Manager''s update')"),
+    ],
+)
+async def test_search_emails_uses_filter_for_standalone_subject_phrase(
+    monkeypatch: pytest.MonkeyPatch,
+    search_input: str,
+    expected_filter: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class DummyGraph:
+        async def get(self, path: str, params: dict | None = None):
+            captured["path"] = path
+            captured["params"] = params or {}
+            return {"value": []}
+
+    monkeypatch.setattr(mail, "get_graph", lambda _profile: DummyGraph())
+    await mail.search_emails(
+        mail.SearchEmailsInput(query=search_input, folder="sentitems")
+    )
+
+    assert captured["path"] == "/me/mailFolders/sentitems/messages"
+    assert captured["params"]["$filter"] == expected_filter
+    assert "$search" not in captured["params"]
 
 
 @pytest.mark.asyncio
