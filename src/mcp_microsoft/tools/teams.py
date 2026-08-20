@@ -966,7 +966,9 @@ async def teams_list_chats(
     query: dict[str, Any] = {
         "$top": params.top,
         "$select": "id,chatType,topic,createdDateTime,lastUpdatedDateTime,webUrl",
-        "$orderby": "lastUpdatedDateTime desc",
+        # Graph's chats endpoint only supports ordering by the timestamp of the
+        # last message; lastUpdatedDateTime is selectable but not orderable.
+        "$orderby": "lastMessagePreview/createdDateTime desc",
     }
     if params.chat_type:
         query["$filter"] = f"chatType eq '{params.chat_type}'"

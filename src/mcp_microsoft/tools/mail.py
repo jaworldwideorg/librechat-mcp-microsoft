@@ -471,8 +471,16 @@ async def search_emails(
         Structured search results.
     """
     g = get_graph(params.profile)
+    search_query = params.query.strip()
+    # Graph requires simple search text to be quoted, but callers may supply a
+    # complete KQL expression containing quoted terms or phrases. Wrapping such
+    # an expression again produces invalid KQL (for example, ``""term" AND
+    # "other""``), so preserve already quoted KQL verbatim.
+    if '"' not in search_query:
+        search_query = f'"{search_query}"'
+
     query_params: dict[str, Any] = {
-        "$search": f'"{params.query}"',
+        "$search": search_query,
         "$top": min(params.max_results, 25),
         "$select": "id,subject,from,receivedDateTime,isRead,bodyPreview,hasAttachments",
     }
