@@ -15,6 +15,11 @@ from mcp_microsoft.tools import calendar, mail, sharepoint, teams
             '"Denmark" AND ("LMS" OR "deployment")',
         ),
         ('subject:"quarterly report"', 'subject:"quarterly report"'),
+        (
+            '("Package" OR Platform OR service.example) AND (Region OR Org)',
+            '("Package" OR Platform OR "service.example") AND (Region OR Org)',
+        ),
+        ('from:user@example.com AND status', 'from:"user@example.com" AND status'),
     ],
 )
 async def test_search_emails_does_not_double_quote_kql(

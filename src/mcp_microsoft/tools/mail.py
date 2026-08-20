@@ -23,6 +23,7 @@ Implemented:
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Literal, Optional
 
 from fastmcp.server.context import Context
@@ -454,6 +455,64 @@ async def read_email(
 # ---------------------------------------------------------------------------
 
 
+_KQL_OPERATORS = frozenset({"AND", "OR", "NOT"})
+_MAIL_KQL_PROPERTIES = frozenset(
+    {
+        "attachment",
+        "bcc",
+        "body",
+        "cc",
+        "from",
+        "hasattachment",
+        "importance",
+        "isread",
+        "kind",
+        "participants",
+        "received",
+        "sent",
+        "subject",
+        "to",
+    }
+)
+
+
+def _normalize_email_search_query(query: str) -> str:
+    """Preserve structured KQL while quoting punctuation-bearing operands."""
+    query = query.strip()
+    is_structured = bool(
+        '"' in query
+        or "(" in query
+        or ")" in query
+        or re.search(r"\b(?:AND|OR|NOT)\b", query, flags=re.IGNORECASE)
+        or re.search(r"\b[A-Za-z][A-Za-z0-9]*:", query)
+    )
+    if not is_structured:
+        return f'"{query}"'
+
+    parts = re.split(r'("(?:\\.|[^"\\])*"|[()\s]+)', query)
+    normalized: list[str] = []
+    for part in parts:
+        if (
+            not part
+            or part.isspace()
+            or part in {"(", ")"}
+            or (part.startswith('"') and part.endswith('"'))
+            or part.upper() in _KQL_OPERATORS
+        ):
+            normalized.append(part)
+            continue
+
+        property_name, separator, value = part.partition(":")
+        if separator and property_name.casefold() in _MAIL_KQL_PROPERTIES:
+            if value and any(character in value for character in ".@"):
+                part = f'{property_name}:"{value}"'
+        elif any(character in part for character in ".@"):
+            part = f'"{part}"'
+        normalized.append(part)
+
+    return "".join(normalized)
+
+
 async def search_emails(
     params: SearchEmailsInput,
 ) -> SearchEmailsResponse:
@@ -474,13 +533,9 @@ async def search_emails(
         Structured search results.
     """
     g = get_graph(params.profile)
-    search_query = params.query.strip()
-    # Graph requires simple search text to be quoted, but callers may supply a
-    # complete KQL expression containing quoted terms or phrases. Wrapping such
-    # an expression again produces invalid KQL (for example, ``""term" AND
-    # "other""``), so preserve already quoted KQL verbatim.
-    if '"' not in search_query:
-        search_query = f'"{search_query}"'
+    # Preserve structured KQL instead of wrapping it in another pair of quotes,
+    # and quote punctuation-bearing operands that Graph rejects when left bare.
+    search_query = _normalize_email_search_query(params.query)
 
     query_params: dict[str, Any] = {
         "$search": search_query,
