@@ -59,6 +59,67 @@ async def test_download_attachment_returns_fastmcp_file(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
+async def test_read_attachment_extracts_pdf_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyGraph:
+        async def get(self, _path: str):
+            return {
+                "name": "report.pdf",
+                "contentType": "application/pdf",
+                "contentBytes": base64.b64encode(b"pdf bytes").decode("ascii"),
+            }
+
+    class DummyPage:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def extract_text(self) -> str:
+            return self.text
+
+    class DummyReader:
+        def __init__(self, _stream) -> None:
+            self.pages = [DummyPage("Page one"), DummyPage("Page two")]
+
+    monkeypatch.setattr(attachments, "get_graph", lambda _profile: DummyGraph())
+    monkeypatch.setattr(attachments, "PdfReader", DummyReader)
+
+    result = await attachments.read_attachment(
+        attachments.ReadAttachmentInput(
+            message_id="message-id",
+            attachment_id="attachment-id",
+        )
+    )
+
+    assert result.filename == "report.pdf"
+    assert result.page_count == 2
+    assert result.text == "Page one\n\nPage two"
+    assert result.truncated is False
+
+
+@pytest.mark.asyncio
+async def test_read_attachment_truncates_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyGraph:
+        async def get(self, _path: str):
+            return {
+                "name": "notes.txt",
+                "contentType": "text/plain",
+                "contentBytes": base64.b64encode(b"abcdefgh").decode("ascii"),
+            }
+
+    monkeypatch.setattr(attachments, "get_graph", lambda _profile: DummyGraph())
+
+    result = await attachments.read_attachment(
+        attachments.ReadAttachmentInput(
+            message_id="message-id",
+            attachment_id="attachment-id",
+            max_characters=4,
+        )
+    )
+
+    assert result.text == "abcd"
+    assert result.truncated is True
+
+
+@pytest.mark.asyncio
 async def test_onedrive_large_upload_does_not_read_entire_file(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

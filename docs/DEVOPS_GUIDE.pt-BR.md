@@ -51,7 +51,7 @@ escolhido na inicialização pela variável de ambiente `MCP_TRANSPORT`:
 | Como as chamadas ao Graph são autorizadas | Token MSAL de client público para o perfil ativo | Troca de token **On-Behalf-Of (OBO)** por usuário a partir do bearer token do chamador |
 | Tipo de app no Azure | Client **público** (plataforma Mobile & desktop) | Client **confidencial** (plataforma Web + segredo) |
 | Contas | Pessoais **e** corporativas/educacionais | **Somente** corporativas/educacionais, um único tenant concreto |
-| Quantidade de ferramentas (com todos os serviços opcionais ativos) | **95** | **87** (ferramentas de gerenciamento de perfil e de disco local omitidas) |
+| Quantidade de ferramentas (com todos os serviços opcionais ativos) | **96** | **88** (ferramentas de gerenciamento de perfil e de disco local omitidas) |
 
 **Arquitetura em cinco linhas:**
 
@@ -543,7 +543,7 @@ HTTP não podem usar o modo http.
 
 | Aspecto | stdio | http |
 |---|---|---|
-| **Quantidade de ferramentas** (todos os serviços opcionais ativos) | **95** | **87** |
+| **Quantidade de ferramentas** (todos os serviços opcionais ativos) | **96** | **88** |
 | **Ferramentas de gerenciamento de perfil** | Registradas | **Não registradas** — `add_ms_profile`, `list_ms_profiles`, `remove_ms_profile`, `authenticate_ms_profile`, `set_default_ms_profile` não existem. |
 | **Argumento `profile`** | Respeitado | **Inerte** — aceito por compatibilidade, mas silenciosamente ignorado; a identidade sempre vem do bearer token. |
 | **Ferramentas de disco local** | Disponíveis | `download_file`, `download_from_site`, `teams_download_meeting_recording` **não são registradas**. `upload_file`/`upload_to_site` rejeitam `local_path` (use `content_base64`); `download_attachment`/`get_contact_photo` rejeitam `save_path` (o conteúdo é retornado inline). |
@@ -884,7 +884,7 @@ As contagens assumem todos os serviços opcionais habilitados.
 
 | Grupo | stdio | http | Observações |
 |---|---|---|---|
-| Mail | 25 | 25 | |
+| Mail | 26 | 26 | Inclui extração de texto de anexos PDF/texto no servidor. |
 | Calendar | 10 | 10 | |
 | OneDrive | 8 | 7 | `download_file` omitido no http. |
 | SharePoint | 13 | 12 | `download_from_site` omitido no http. |
@@ -892,7 +892,7 @@ As contagens assumem todos os serviços opcionais habilitados.
 | Teams | 25 | 24 | `teams_download_meeting_recording` omitido no http. |
 | Gerenciamento de perfil | 5 | 0 | Não registrado no http. |
 | Utilitários de serviço | 1 | 1 | `list_enabled_services`. |
-| **Total** | **95** | **87** | |
+| **Total** | **96** | **88** | |
 
 **Ferramentas totalmente omitidas no modo http:** `add_ms_profile`, `list_ms_profiles`,
 `remove_ms_profile`, `authenticate_ms_profile`, `set_default_ms_profile` (gerenciamento de perfil);

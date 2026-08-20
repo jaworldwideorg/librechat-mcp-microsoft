@@ -50,7 +50,7 @@ As of 0.8.0 the server runs in one of **two mutually exclusive modes**, chosen a
 | How Graph calls are authorized | MSAL public-client token for the active profile | Per-user **On-Behalf-Of (OBO)** token exchange from the caller's bearer token |
 | Azure app type | **Public** client (Mobile & desktop platform) | **Confidential** client (Web platform + secret) |
 | Accounts | Personal **and** work/school | Work/school **only**, single concrete tenant |
-| Tool count (all optional services on) | **95** | **87** (profile-management + local-disk tools omitted) |
+| Tool count (all optional services on) | **96** | **88** (profile-management + local-disk tools omitted) |
 
 **Architecture in five lines:**
 
@@ -508,10 +508,10 @@ http mode.
 
 | Aspect | stdio | http |
 |---|---|---|
-| **Tool count** (all optional services on) | **95** | **87** |
+| **Tool count** (all optional services on) | **96** | **88** |
 | **Profile-management tools** | Registered | **Not registered** — `add_ms_profile`, `list_ms_profiles`, `remove_ms_profile`, `authenticate_ms_profile`, `set_default_ms_profile` do not exist. |
 | **`profile` argument** | Honored | **Inert** — accepted for compatibility, silently ignored; identity always comes from the bearer token. |
-| **Local-disk tools** | Available | `download_file`, `download_from_site`, `teams_download_meeting_recording` are **not registered**. `upload_file`/`upload_to_site` reject `local_path` (use `content_base64`); `download_attachment`/`get_contact_photo` reject `save_path` (content returned inline). |
+| **Local-disk tools** | Available | `download_file`, `download_from_site`, `teams_download_meeting_recording` are **not registered**. `upload_file`/`upload_to_site` reject `local_path` (use `content_base64`); `download_attachment` omits `save_path` and returns content inline; `read_attachment` extracts PDF/text content for the model. |
 | **Feature flags** | Env or corporate auto-detect | Env **only** (explicit). |
 | **Deletion kill-switch** | Works | Works identically. |
 | **Rate limiting / audit logging** | None (single local caller) | On by default. |
@@ -826,7 +826,7 @@ Counts assume all optional services enabled.
 
 | Group | stdio | http | Notes |
 |---|---|---|---|
-| Mail | 25 | 25 | |
+| Mail | 26 | 26 | Includes server-side PDF/text attachment extraction. |
 | Calendar | 10 | 10 | |
 | OneDrive | 8 | 7 | `download_file` omitted in http. |
 | SharePoint | 13 | 12 | `download_from_site` omitted in http. |
@@ -834,15 +834,16 @@ Counts assume all optional services enabled.
 | Teams | 25 | 24 | `teams_download_meeting_recording` omitted in http. |
 | Profile management | 5 | 0 | Not registered in http. |
 | Service utilities | 1 | 1 | `list_enabled_services`. |
-| **Total** | **95** | **87** | |
+| **Total** | **96** | **88** | |
 
 **Tools omitted entirely in http mode:** `add_ms_profile`, `list_ms_profiles`, `remove_ms_profile`,
 `authenticate_ms_profile`, `set_default_ms_profile` (profile management); `download_file`,
 `download_from_site`, `teams_download_meeting_recording` (local-disk downloads).
 
 **Tools that reject disk parameters in http mode** (but remain registered): `upload_file` /
-`upload_to_site` reject `local_path` (use `content_base64`); `download_attachment` /
-`get_contact_photo` reject `save_path` (content returned inline).
+`upload_to_site` reject `local_path` (use `content_base64`); `download_attachment`
+omits `save_path` in http mode (content returned inline); `get_contact_photo` rejects
+`save_path`. Use `read_attachment` when the model needs PDF or text contents directly.
 
 ---
 

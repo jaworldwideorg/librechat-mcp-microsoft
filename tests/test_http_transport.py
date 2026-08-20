@@ -901,7 +901,9 @@ async def test_download_attachment_http_schema_omits_save_path(
         for tool in await mcp.list_tools(run_middleware=False)
         if tool.name == "download_attachment"
     )
+    names = {tool.name for tool in await mcp.list_tools(run_middleware=False)}
 
+    assert "read_attachment" in names
     input_properties = tool.parameters["$defs"]["DownloadAttachmentHttpInput"][
         "properties"
     ]
