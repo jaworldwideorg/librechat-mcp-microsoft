@@ -270,6 +270,7 @@ You need an Azure App Registration to get a `client_id`. This is a one-time step
    - `Mail.ReadWrite`
    - `Mail.Send`
    - `Calendars.ReadWrite`
+   - `Calendars.Read.Shared` *(required by `find_meeting_times`)*
    - `Contacts.ReadWrite`
    - `Files.ReadWrite`
    - `offline_access` *(usually pre-added)*
@@ -299,7 +300,7 @@ For a detailed walkthrough with screenshots, see [`docs/azure-setup.md`](docs/az
 | Module | Personal (Outlook.com/Live) | Work/School (Azure AD/Entra) |
 |---|---|---|
 | Mail | Yes | Yes |
-| Calendar | Yes | Yes |
+| Calendar | Yes, except availability and meeting-time suggestions | Yes |
 | OneDrive | Yes | Yes |
 | Contacts | Yes | Yes |
 | SharePoint | No | Yes (admin consent required) |

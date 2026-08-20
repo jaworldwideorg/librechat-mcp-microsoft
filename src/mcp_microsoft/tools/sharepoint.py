@@ -930,6 +930,7 @@ async def delete_list_item(
 _SEARCH_ENTITY_TYPES = frozenset(
     {"driveItem", "listItem", "site", "message", "event", "chatMessage"}
 )
+_SEARCH_ISOLATED_ENTITY_TYPES = frozenset({"message", "event", "chatMessage"})
 
 # Fields requested from Graph for driveItem hits.
 _DRIVE_ITEM_FIELDS = [
@@ -1028,7 +1029,15 @@ async def search_content(
             f"Valid types: {sorted(_SEARCH_ENTITY_TYPES)}"
         )
 
-    max_results = max(1, min(500, params.max_results))
+    isolated = _SEARCH_ISOLATED_ENTITY_TYPES.intersection(entity_types)
+    if isolated and len(entity_types) != 1:
+        raise ValueError(
+            f"Graph requires {min(isolated)!r} to be searched separately; "
+            "it cannot be combined with other entity types."
+        )
+
+    max_page_size = 25 if isolated else 500
+    max_results = max(1, min(max_page_size, params.max_results))
 
     # Build the $search request object.
     search_request: dict = {
@@ -1039,9 +1048,9 @@ async def search_content(
     }
 
     # Request only the fields we need to keep responses lean.
-    if "driveItem" in entity_types:
+    if entity_types == ["driveItem"]:
         search_request["fields"] = _DRIVE_ITEM_FIELDS
-    elif "listItem" in entity_types:
+    elif entity_types == ["listItem"]:
         search_request["fields"] = _LIST_ITEM_FIELDS
 
     g = _get_sharepoint_graph(params.profile)

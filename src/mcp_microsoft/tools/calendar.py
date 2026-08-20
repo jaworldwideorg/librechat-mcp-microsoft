@@ -376,7 +376,7 @@ async def list_upcoming_events(
     if params.calendar_id:
         path = f"/me/calendars/{params.calendar_id}/calendarView"
     else:
-        path = "/me/calendar/calendarView"
+        path = "/me/calendarView"
 
     result = await g.get(path, params=query)
     events = parse_graph_collection(result, GraphEvent)

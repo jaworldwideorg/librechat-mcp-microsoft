@@ -118,7 +118,7 @@ async def test_teams_find_meeting_by_url_escapes_filter_and_returns_detail(
 
     assert result.id == "meeting-1"
     assert captured["path"] == "/me/onlineMeetings"
-    assert captured["params"]["$filter"] == "joinWebUrl eq 'https://teams.microsoft.com/l/meetup-join/abc?context=it''s'"
+    assert captured["params"]["$filter"] == "JoinWebUrl eq 'https://teams.microsoft.com/l/meetup-join/abc?context=it''s'"
 
 
 @pytest.mark.asyncio

@@ -1255,6 +1255,15 @@ async def test_teams_list_meetings_returns_meetings(monkeypatch: pytest.MonkeyPa
 
     class DummyGraph:
         async def get(self, path: str, params: dict = None):
+            if path == "/me/calendarView":
+                return {
+                    "value": [{
+                        "id": "event-1",
+                        "subject": "Daily Standup",
+                        "isOnlineMeeting": True,
+                        "onlineMeeting": {"joinUrl": "https://teams.microsoft.com/l/meetup-join/standup"},
+                    }]
+                }
             return {
                 "value": [
                     {
@@ -1279,12 +1288,13 @@ async def test_teams_list_meetings_returns_meetings(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
-async def test_teams_list_meetings_applies_datetime_filter(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify teams_list_meetings always includes $filter param."""
+async def test_teams_list_meetings_uses_calendar_view_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify meeting enumeration uses supported calendarView parameters."""
     captured: dict[str, object] = {}
 
     class DummyGraph:
         async def get(self, path: str, params: dict = None):
+            captured["path"] = path
             captured["params"] = params or {}
             return {"value": []}
 
@@ -1296,10 +1306,10 @@ async def test_teams_list_meetings_applies_datetime_filter(monkeypatch: pytest.M
         )
     )
 
-    assert "$filter" in captured["params"]
-    filter_str = captured["params"]["$filter"]
-    assert "startDateTime ge" in filter_str
-    assert "startDateTime le" in filter_str
+    assert captured["path"] == "/me/calendarView"
+    assert captured["params"]["startDateTime"] == "2026-04-01T00:00:00Z"
+    assert captured["params"]["endDateTime"] == "2026-04-30T00:00:00Z"
+    assert "$filter" not in captured["params"]
 
 
 @pytest.mark.asyncio

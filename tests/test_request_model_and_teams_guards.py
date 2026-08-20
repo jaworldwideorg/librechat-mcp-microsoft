@@ -59,9 +59,10 @@ async def test_teams_list_meetings_normalizes_datetime_filters(
 
     assert result.count == 0
     assert captured["params"] == {
-        "$filter": "startDateTime ge '2026-04-10T17:00:00Z' and startDateTime le '2026-04-10T15:00:00Z'",
-        "$top": 10,
-        "$select": "id,subject,startDateTime,endDateTime,joinWebUrl,createdDateTime",
+        "startDateTime": "2026-04-10T17:00:00Z",
+        "endDateTime": "2026-04-10T15:00:00Z",
+        "$top": 50,
+        "$select": "id,subject,start,end,isOnlineMeeting,onlineMeeting,onlineMeetingUrl,createdDateTime",
     }
 
 

@@ -134,6 +134,7 @@ DEFAULT_SCOPES: list[str] = [
     "Mail.Send",
     # Calendar
     "Calendars.ReadWrite",
+    "Calendars.Read.Shared",
     # Contacts
     "Contacts.ReadWrite",
     # OneDrive
