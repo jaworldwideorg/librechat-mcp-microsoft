@@ -39,6 +39,15 @@ class DownloadAttachmentInput(ToolRequestModel):
     save_path: Path | None = None
     profile: str | None = None
 
+
+class DownloadAttachmentHttpInput(ToolRequestModel):
+    """HTTP input excludes server-local paths that remote callers cannot use."""
+
+    message_id: str
+    attachment_id: str
+    profile: str | None = None
+
+
 async def list_attachments(params: ListAttachmentsInput) -> ListAttachmentsResponse:
     """
     List all attachments on an email message.
@@ -162,10 +171,43 @@ async def download_attachment(
     )
 
 
+async def download_attachment_http(
+    params: DownloadAttachmentHttpInput,
+) -> DownloadAttachmentResponse | File:
+    """Download an email attachment and return it inline to the remote client.
+
+    The remote HTTP server cannot write to a caller's filesystem. The attachment
+    is therefore always returned as an inline FastMCP file payload.
+
+    Args:
+        message_id: The Graph message ID.
+        attachment_id: The Graph attachment ID.
+        profile: Ignored in HTTP mode; identity comes from the caller's token.
+
+    Returns:
+        The attachment as an inline FastMCP file payload.
+    """
+    return await download_attachment(
+        DownloadAttachmentInput(
+            message_id=params.message_id,
+            attachment_id=params.attachment_id,
+            profile=params.profile,
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 def register(server) -> None:
     """Register all attachment tools with the given FastMCP server instance."""
     register_tool(server, list_attachments, annotations=READ_ONLY_TOOL)
-    register_tool(server, download_attachment, annotations=WRITE_TOOL)
+    if get_app_config().transport == "http":
+        register_tool(
+            server,
+            download_attachment_http,
+            name="download_attachment",
+            annotations=READ_ONLY_TOOL,
+        )
+    else:
+        register_tool(server, download_attachment, annotations=WRITE_TOOL)

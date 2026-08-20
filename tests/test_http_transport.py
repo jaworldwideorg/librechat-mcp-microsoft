@@ -885,21 +885,65 @@ async def test_onedrive_download_file_registered_in_stdio_mode(
 
 
 @pytest.mark.asyncio
-async def test_download_attachment_rejects_save_path_in_http_mode(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+async def test_download_attachment_http_schema_omits_save_path(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from fastmcp import FastMCP
+
+    from mcp_microsoft.tools import attachments
+
+    monkeypatch.setattr(attachments, "get_app_config", lambda: AppConfig(transport="http"))
+    mcp = FastMCP("test-server")
+    attachments.register(mcp)
+
+    tool = next(
+        tool
+        for tool in await mcp.list_tools(run_middleware=False)
+        if tool.name == "download_attachment"
+    )
+
+    input_properties = tool.parameters["$defs"]["DownloadAttachmentHttpInput"][
+        "properties"
+    ]
+    assert "save_path" not in input_properties
+    assert set(input_properties) == {
+        "message_id",
+        "attachment_id",
+        "profile",
+    }
+
+
+@pytest.mark.asyncio
+async def test_download_attachment_http_returns_file_inline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import base64
+
+    from fastmcp.utilities.types import File
+
     from mcp_microsoft.tools import attachments
 
     monkeypatch.setattr(attachments, "get_app_config", lambda: AppConfig(transport="http"))
 
-    with pytest.raises(ValueError, match="not available in multi-user http mode"):
-        await attachments.download_attachment(
-            attachments.DownloadAttachmentInput(
-                message_id="m1",
-                attachment_id="a1",
-                save_path=tmp_path / "out.bin",
-            )
+    class DummyGraph:
+        async def get(self, _path: str):
+            return {
+                "name": "report.txt",
+                "contentType": "text/plain",
+                "contentBytes": base64.b64encode(b"report").decode("ascii"),
+            }
+
+    monkeypatch.setattr(attachments, "get_graph", lambda _profile: DummyGraph())
+
+    result = await attachments.download_attachment_http(
+        attachments.DownloadAttachmentHttpInput(
+            message_id="message-id",
+            attachment_id="attachment-id",
         )
+    )
+
+    assert isinstance(result, File)
+    assert result.data == b"report"
 
 
 @pytest.mark.asyncio
