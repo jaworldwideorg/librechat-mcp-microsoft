@@ -18,9 +18,14 @@ Implemented:
 from __future__ import annotations
 
 import base64
+import binascii
+import hashlib
+import hmac
 from pathlib import Path
-from typing import Any, Optional
-from urllib.parse import parse_qs, urlparse
+from typing import Any, Literal, Optional
+from urllib.parse import unquote, urlsplit
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from mcp_microsoft.common.tooling import DESTRUCTIVE_TOOL, READ_ONLY_TOOL, WRITE_TOOL, register_tool
 from mcp_microsoft.config import get_app_config
@@ -58,12 +63,29 @@ _CONTACT_DETAIL_SELECT = (
     "mobilePhone,businessPhones,jobTitle,companyName,department,personalNotes"
 )
 
+_CONTACT_SEARCH_MAX_PAGES = 5
+_CONTACT_SEARCH_SCAN_PAGE_SIZE = 100
+_CONTACT_SEARCH_CURSOR_MAX_LENGTH = 16_384
+_GRAPH_CONTINUATION_MAX_LENGTH = 12_000
+_CONTACT_SEARCH_CURSOR_PREFIX = "c1."
+
+
+class _ContactCursorState(BaseModel):
+    """Versioned state for resuming inside a locally filtered Graph page."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1] = 1
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    page_link: str | None = Field(default=None, max_length=_GRAPH_CONTINUATION_MAX_LENGTH)
+    offset: int = Field(ge=0, le=_CONTACT_SEARCH_SCAN_PAGE_SIZE)
+
 
 class ListContactsInput(ToolRequestModel):
     folder_id: str | None = None
-    search: str | None = None
+    search: str | None = Field(default=None, min_length=1, max_length=256)
     top: int = 50
-    skip_token: str | None = None
+    skip_token: str | None = Field(default=None, max_length=_CONTACT_SEARCH_CURSOR_MAX_LENGTH)
     profile: str | None = None
 
 
@@ -112,8 +134,9 @@ class ListContactFoldersInput(ToolRequestModel):
 
 
 class SearchContactsInput(ToolRequestModel):
-    query: str
-    top: int = 25
+    query: str = Field(min_length=1, max_length=256)
+    top: int = Field(default=25, ge=1, le=100)
+    skip_token: str | None = Field(default=None, max_length=_CONTACT_SEARCH_CURSOR_MAX_LENGTH)
     profile: str | None = None
 
 
@@ -152,6 +175,184 @@ def _normalize_contact(c: GraphContact | dict[str, Any]) -> ContactInfo:
     )
 
 
+def _normalize_search_query(query: str) -> str:
+    """Validate a local contact-search term before any Graph requests."""
+    normalized = query.strip()
+    if not normalized:
+        raise ValueError("search query must not be empty")
+    if len(normalized) > 256 or any(ord(char) < 0x20 for char in normalized):
+        raise ValueError("search query must be ≤256 printable characters")
+    return normalized
+
+
+def _contact_cursor_fingerprint(path: str, query: str | None) -> str:
+    """Bind a cursor to one contact collection and normalized search term."""
+    material = f"{path}\0{(query or '').casefold()}".encode()
+    return hashlib.sha256(material).hexdigest()
+
+
+def _graph_continuation_request(next_link: str, expected_path: str) -> str:
+    """Validate a Graph nextLink and preserve its complete path and query."""
+    if not next_link or len(next_link) > _GRAPH_CONTINUATION_MAX_LENGTH:
+        raise ValueError("Microsoft Graph returned an invalid contact continuation link")
+
+    parsed = urlsplit(next_link)
+    expected_graph_path = f"/v1.0{expected_path}"
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.netloc.casefold() != "graph.microsoft.com"
+        or unquote(parsed.path) != expected_graph_path
+        or not parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Microsoft Graph returned an invalid contact continuation link")
+
+    relative_path = parsed.path.removeprefix("/v1.0")
+    return f"{relative_path}?{parsed.query}"
+
+
+def _encode_contact_cursor(
+    *,
+    fingerprint: str,
+    page_link: str | None,
+    offset: int,
+) -> str:
+    state = _ContactCursorState(
+        fingerprint=fingerprint,
+        page_link=page_link,
+        offset=offset,
+    )
+    payload = base64.urlsafe_b64encode(state.model_dump_json().encode()).rstrip(b"=")
+    cursor = f"{_CONTACT_SEARCH_CURSOR_PREFIX}{payload.decode('ascii')}"
+    if len(cursor) > _CONTACT_SEARCH_CURSOR_MAX_LENGTH:
+        raise ValueError("Microsoft Graph returned an oversized contact continuation link")
+    return cursor
+
+
+def _decode_contact_cursor(
+    cursor: str,
+    *,
+    fingerprint: str,
+    expected_path: str,
+) -> tuple[str | None, int]:
+    try:
+        if not cursor.startswith(_CONTACT_SEARCH_CURSOR_PREFIX):
+            raise ValueError
+        encoded = cursor.removeprefix(_CONTACT_SEARCH_CURSOR_PREFIX)
+        padding = "=" * (-len(encoded) % 4)
+        payload = base64.b64decode(
+            f"{encoded}{padding}",
+            altchars=b"-_",
+            validate=True,
+        )
+        state = _ContactCursorState.model_validate_json(payload)
+    except (binascii.Error, UnicodeError, ValidationError, ValueError) as exc:
+        raise ValueError("contact search cursor is invalid or expired") from None
+
+    if not hmac.compare_digest(state.fingerprint, fingerprint):
+        raise ValueError("contact search cursor does not match this query or folder")
+    if state.page_link is not None:
+        _graph_continuation_request(state.page_link, expected_path)
+    return state.page_link, state.offset
+
+
+def _contact_matches(contact: GraphContact, query: str) -> bool:
+    needle = query.casefold()
+    values = [contact.display_name, contact.given_name, contact.surname]
+    values.extend(address.address for address in (contact.email_addresses or []))
+    values.extend(address.name for address in (contact.email_addresses or []))
+    return any(needle in (value or "").casefold() for value in values)
+
+
+async def _scan_contact_pages(
+    g: Any,
+    *,
+    path: str,
+    query: str | None,
+    top: int,
+    cursor: str | None,
+) -> tuple[list[GraphContact], str | None, int]:
+    """Page contacts with a scan size independent from the returned result size."""
+    normalized_query = _normalize_search_query(query) if query is not None else None
+    fingerprint = _contact_cursor_fingerprint(path, normalized_query)
+    page_link, page_offset = (
+        _decode_contact_cursor(
+            cursor,
+            fingerprint=fingerprint,
+            expected_path=path,
+        )
+        if cursor is not None
+        else (None, 0)
+    )
+    matches: list[GraphContact] = []
+    pages_scanned = 0
+    max_pages = _CONTACT_SEARCH_MAX_PAGES if normalized_query is not None else 1
+
+    while pages_scanned < max_pages:
+        current_page_link = page_link
+        if current_page_link is None:
+            result = await g.get(
+                path,
+                params={
+                    "$select": _CONTACT_SELECT,
+                    "$top": _CONTACT_SEARCH_SCAN_PAGE_SIZE,
+                    "$orderby": "displayName",
+                },
+            )
+        else:
+            request_path = _graph_continuation_request(current_page_link, path)
+            result = await g.get(request_path)
+
+        page = parse_graph_collection(result or {}, GraphContact)
+        pages_scanned += 1
+        if len(page) > _CONTACT_SEARCH_SCAN_PAGE_SIZE:
+            raise ValueError("Microsoft Graph returned an oversized contact page")
+        if page_offset > len(page):
+            raise ValueError("contact search cursor is invalid or expired")
+
+        next_link = (result or {}).get("@odata.nextLink") or None
+        if next_link is not None:
+            _graph_continuation_request(next_link, path)
+
+        index = page_offset
+        while index < len(page):
+            contact = page[index]
+            index += 1
+            if normalized_query is None or _contact_matches(contact, normalized_query):
+                matches.append(contact)
+                if len(matches) == top:
+                    if index < len(page):
+                        next_cursor = _encode_contact_cursor(
+                            fingerprint=fingerprint,
+                            page_link=current_page_link,
+                            offset=index,
+                        )
+                    elif next_link is not None:
+                        next_cursor = _encode_contact_cursor(
+                            fingerprint=fingerprint,
+                            page_link=next_link,
+                            offset=0,
+                        )
+                    else:
+                        next_cursor = None
+                    return matches, next_cursor, pages_scanned
+
+        if next_link is None:
+            return matches, None, pages_scanned
+        page_link = next_link
+        page_offset = 0
+
+    return (
+        matches,
+        _encode_contact_cursor(
+            fingerprint=fingerprint,
+            page_link=page_link,
+            offset=page_offset,
+        ),
+        pages_scanned,
+    )
+
+
 # ---------------------------------------------------------------------------
 # list_contacts
 # ---------------------------------------------------------------------------
@@ -164,57 +365,39 @@ async def list_contacts(params: ListContactsInput) -> ListContactsResponse:
     Args:
         top: Maximum number of contacts to return (1-100). Defaults to 25.
         folder_id: Optional contact folder ID. Omit to use the default contacts folder.
-        search: Optional Graph `$search` expression for server-side search.
-        skip_token: Pagination cursor returned by a previous call.
+        search: Optional case-insensitive text matched against contact names and
+            email addresses.
+        skip_token: Opaque pagination cursor returned by a previous call.
         profile: Microsoft 365 profile to use. Omit to use the default profile.
 
     Returns:
         Structured list of contacts with id, name, email, phone, and job info.
-        When has_more is True, pass next_page_token as skip_token to retrieve
-        the next page.
+        When has_more is True, pass next_page_token as skip_token to continue
+        scanning without repeating contacts.
     """
     g = get_graph(params.profile)
     top = max(1, min(params.top, 100))
-
-    query: dict[str, Any] = {
-        "$select": _CONTACT_SELECT,
-        "$top": top,
-        "$orderby": "displayName",
-    }
-    if params.skip_token is not None:
-        query["$skiptoken"] = params.skip_token
-
-    extra_headers: dict[str, str] | None = None
-    if params.search:
-        # Reject control characters and cap length — $search is a free-text term,
-        # not a $filter expression, but degenerate input still produces noisy queries.
-        raw_search = params.search
-        if any(ord(c) < 0x20 for c in raw_search) or len(raw_search) > 256:
-            raise ValueError("search must be ≤256 printable characters")
-        # $search requires ConsistencyLevel: eventual
-        query["$search"] = raw_search
-        extra_headers = {"ConsistencyLevel": "eventual"}
 
     if params.folder_id:
         path = f"/me/contactFolders/{params.folder_id}/contacts"
     else:
         path = "/me/contacts"
 
-    result = await g.get(path, params=query, headers=extra_headers)
-    contacts = parse_graph_collection(result or {}, GraphContact)
-
-    next_link = (result or {}).get("@odata.nextLink", "")
-    next_page_token: str | None = None
-    if next_link:
-        qs = parse_qs(urlparse(next_link).query)
-        next_page_token = qs.get("$skiptoken", [None])[0]
+    contacts, next_page_token, pages_scanned = await _scan_contact_pages(
+        g,
+        path=path,
+        query=params.search,
+        top=top,
+        cursor=params.skip_token,
+    )
 
     return ListContactsResponse(
         count=len(contacts),
         folder_id=params.folder_id,
-        contacts=[_normalize_contact(c) for c in contacts],
+        contacts=[_normalize_contact(contact) for contact in contacts],
         next_page_token=next_page_token,
         has_more=(next_page_token is not None),
+        pages_scanned=pages_scanned,
     )
 
 
@@ -480,40 +663,38 @@ async def list_contact_folders(
 
 async def search_contacts(params: SearchContactsInput) -> SearchContactsResponse:
     """
-    Search contacts by display name prefix using $filter startswith.
+    Search contacts locally across names and email addresses.
 
-    Uses OData $filter with startswith() for broad tenant compatibility.
-    For full-text search, use list_contacts with the search parameter instead.
+    Microsoft Graph does not support general contact search. This tool scans at
+    most five ordered Graph pages per call and returns an opaque cursor when
+    more contacts remain.
 
     Args:
-        query: Prefix to match against `displayName`.
-        top: Maximum number of contacts to return (1-100). Defaults to 25.
+        query: Case-insensitive text to match against names and email addresses.
+        top: Maximum number of contacts to return (1-100). Defaults to 50.
+        skip_token: Opaque pagination cursor returned by a previous call.
         profile: Microsoft 365 profile to use. Omit to use the default profile.
 
     Returns:
-        Contacts whose displayName starts with the given query.
+        Matching contacts and a continuation cursor when more contacts remain
+        to scan. A continuation can yield no matches before the scan completes.
     """
     g = get_graph(params.profile)
-    top = max(1, min(params.top, 100))
-
-    # Escape single quotes by doubling (OData literal-string convention) to
-    # prevent injection via the $filter clause below.
-    safe_query = params.query.replace("'", "''")
-
-    query_params: dict[str, Any] = {
-        "$select": _CONTACT_SELECT,
-        "$filter": f"startswith(displayName,'{safe_query}')",
-        "$top": top,
-        "$orderby": "displayName",
-    }
-
-    result = await g.get("/me/contacts", params=query_params)
-    contacts = parse_graph_collection(result or {}, GraphContact)
+    contacts, next_page_token, pages_scanned = await _scan_contact_pages(
+        g,
+        path="/me/contacts",
+        query=params.query,
+        top=params.top,
+        cursor=params.skip_token,
+    )
 
     return SearchContactsResponse(
         query=params.query,
         count=len(contacts),
         contacts=[_normalize_contact(c) for c in contacts],
+        next_page_token=next_page_token,
+        has_more=(next_page_token is not None),
+        pages_scanned=pages_scanned,
     )
 
 

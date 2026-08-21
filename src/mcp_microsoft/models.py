@@ -777,6 +777,7 @@ class ListContactsResponse(MCPModel):
     contacts: list[ContactInfo] = Field(default_factory=list)
     next_page_token: str | None = None
     has_more: bool = False
+    pages_scanned: int = 0
 
 
 class GetContactResponse(MCPModel):
@@ -825,6 +826,9 @@ class SearchContactsResponse(MCPModel):
     query: str = ""
     count: int = 0
     contacts: list[ContactInfo] = Field(default_factory=list)
+    next_page_token: str | None = None
+    has_more: bool = False
+    pages_scanned: int = 0
 
 
 class GetContactPhotoResponse(ActionResult):

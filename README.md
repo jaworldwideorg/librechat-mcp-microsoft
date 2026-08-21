@@ -82,13 +82,13 @@ The server ships as an MCPB bundle (`mcp-microsoft.mcpb`) for zero-friction inst
 
 #### Contacts (8 tools)
 
-- `list_contacts` — list contacts with optional folder scope and field selection
+- `list_contacts` — list contacts with optional folder scope, bounded local search, and opaque pagination cursors
 - `get_contact` — retrieve a single contact by ID
 - `create_contact` — create a new contact with name, email, phone, org, and notes
 - `update_contact` — update any subset of contact fields
 - `delete_contact` — delete a contact by ID (irreversible)
 - `list_contact_folders` — enumerate contact folders in the mailbox
-- `search_contacts` — search contacts by display name or email
+- `search_contacts` — search names and email addresses locally, scanning at most 500 contacts per call and returning a continuation cursor when needed
 - `get_contact_photo` — fetch a contact's profile photo as base64 or save to disk
 
 #### Teams (25 tools)

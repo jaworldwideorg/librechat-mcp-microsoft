@@ -306,59 +306,269 @@ async def test_list_contact_folders_returns_structured_response(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_search_contacts_uses_startswith_filter(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify search_contacts uses OData $filter with startswith."""
+async def test_search_contacts_matches_names_and_emails_locally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Search terms are never interpolated into Graph query syntax."""
     captured: dict[str, object] = {}
 
     class DummyGraph:
         async def get(self, path: str, params: dict = None, headers: dict = None):
             captured["params"] = params
-            return {"value": []}
+            return {
+                "value": [
+                    {"id": "1", "displayName": "Alice Jones", "emailAddresses": []},
+                    {
+                        "id": "2",
+                        "displayName": "Bob Jones",
+                        "emailAddresses": [{"address": "alice@example.com"}],
+                    },
+                    {"id": "3", "displayName": "Carol Smith", "emailAddresses": []},
+                ]
+            }
 
     monkeypatch.setattr(contacts, "get_graph", lambda _profile: DummyGraph())
-    await contacts.search_contacts(contacts.SearchContactsInput(query="Alice"))
+    result = await contacts.search_contacts(contacts.SearchContactsInput(query="Alice"))
 
-    assert "$filter" in captured["params"]
-    assert "startswith(displayName,'Alice')" in captured["params"]["$filter"]
+    assert "$filter" not in captured["params"]
+    assert "$search" not in captured["params"]
+    assert [contact.id for contact in result.contacts] == ["1", "2"]
+    assert result.has_more is False
+    assert result.pages_scanned == 1
 
 
 @pytest.mark.asyncio
-async def test_search_contacts_escapes_quotes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify search_contacts doubles single quotes per the OData escape rule."""
-    captured: dict[str, object] = {}
+async def test_search_contacts_stops_after_bounded_page_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict | None]] = []
 
     class DummyGraph:
         async def get(self, path: str, params: dict = None, headers: dict = None):
-            captured["params"] = params
-            return {"value": []}
+            calls.append((path, params.copy() if params else None))
+            token = f"page-{len(calls)}"
+            return {
+                "value": [{"id": token, "displayName": "No match", "emailAddresses": []}],
+                "@odata.nextLink": (
+                    "https://graph.microsoft.com/v1.0/me/contacts?"
+                    f"%24top=100&%24skiptoken={token}&%24orderby=displayName"
+                ),
+            }
 
     monkeypatch.setattr(contacts, "get_graph", lambda _profile: DummyGraph())
-    await contacts.search_contacts(contacts.SearchContactsInput(query="O'Reilly"))
+    result = await contacts.search_contacts(contacts.SearchContactsInput(query="Alice"))
 
-    # Quote-doubling produces a syntactically valid OData literal that
-    # preserves the apostrophe rather than silently mangling user input.
-    assert "startswith(displayName,'O''Reilly')" in captured["params"]["$filter"]
+    assert len(calls) == contacts._CONTACT_SEARCH_MAX_PAGES
+    assert result.contacts == []
+    assert result.pages_scanned == contacts._CONTACT_SEARCH_MAX_PAGES
+    assert result.has_more is True
+    assert result.next_page_token is not None
+    assert calls[0][1]["$top"] == contacts._CONTACT_SEARCH_SCAN_PAGE_SIZE
+    assert all(params is None for _, params in calls[1:])
+    assert calls[1][0].endswith("%24top=100&%24skiptoken=page-1&%24orderby=displayName")
 
 
 @pytest.mark.asyncio
-async def test_search_contacts_injection_cannot_escape_filter(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify a probe attempting to break out of the literal stays contained."""
+async def test_search_contacts_small_top_finds_late_matches_and_resumes_within_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict | None]] = []
+
+    class DummyGraph:
+        async def get(self, path: str, params: dict = None, headers: dict = None):
+            calls.append((path, params.copy() if params else None))
+            return {
+                "value": [
+                    {"id": "1", "displayName": "Bob", "emailAddresses": []},
+                    {"id": "2", "displayName": "Carol", "emailAddresses": []},
+                    {"id": "3", "displayName": "Dan", "emailAddresses": []},
+                    {"id": "4", "displayName": "Alice A", "emailAddresses": []},
+                    {"id": "5", "displayName": "Alice B", "emailAddresses": []},
+                ]
+            }
+
+    monkeypatch.setattr(contacts, "get_graph", lambda _profile: DummyGraph())
+    first = await contacts.search_contacts(
+        contacts.SearchContactsInput(query="Alice", top=1)
+    )
+    second = await contacts.search_contacts(
+        contacts.SearchContactsInput(
+            query="Alice",
+            top=1,
+            skip_token=first.next_page_token,
+        )
+    )
+
+    assert [contact.id for contact in first.contacts] == ["4"]
+    assert first.has_more is True
+    assert first.next_page_token is not None
+    assert [contact.id for contact in second.contacts] == ["5"]
+    assert second.has_more is False
+    assert second.next_page_token is None
+    assert all(params["$top"] == contacts._CONTACT_SEARCH_SCAN_PAGE_SIZE for _, params in calls)
+
+
+@pytest.mark.asyncio
+async def test_search_contacts_replays_the_entire_graph_next_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict | None]] = []
+
+    class DummyGraph:
+        async def get(self, path: str, params: dict = None, headers: dict = None):
+            calls.append((path, params.copy() if params else None))
+            if len(calls) == 1:
+                return {
+                    "value": [
+                        {"id": "1", "displayName": "Bob", "emailAddresses": []}
+                    ],
+                    "@odata.nextLink": (
+                        "https://graph.microsoft.com/v1.0/me/contacts?"
+                        "%24top=100&%24skiptoken=opaque%2Bvalue%3D&%24orderby=displayName"
+                    ),
+                }
+            return {
+                "value": [
+                    {"id": "2", "displayName": "Alice B", "emailAddresses": []}
+                ]
+            }
+
+    monkeypatch.setattr(contacts, "get_graph", lambda _profile: DummyGraph())
+    result = await contacts.search_contacts(
+        contacts.SearchContactsInput(query="Alice", top=1)
+    )
+
+    assert [contact.id for contact in result.contacts] == ["2"]
+    assert calls[1] == (
+        "/me/contacts?%24top=100&%24skiptoken=opaque%2Bvalue%3D&%24orderby=displayName",
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_contacts_small_top_has_complete_opaque_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    class DummyGraph:
+        async def get(self, path: str, params: dict = None, headers: dict = None):
+            calls.append(params.copy())
+            return {
+                "value": [
+                    {"id": str(index), "displayName": f"Contact {index}", "emailAddresses": []}
+                    for index in range(1, 6)
+                ]
+            }
+
+    monkeypatch.setattr(contacts, "get_graph", lambda _profile: DummyGraph())
+    first = await contacts.list_contacts(contacts.ListContactsInput(top=2))
+    second = await contacts.list_contacts(
+        contacts.ListContactsInput(top=2, skip_token=first.next_page_token)
+    )
+    third = await contacts.list_contacts(
+        contacts.ListContactsInput(top=2, skip_token=second.next_page_token)
+    )
+
+    assert [contact.id for contact in first.contacts] == ["1", "2"]
+    assert [contact.id for contact in second.contacts] == ["3", "4"]
+    assert [contact.id for contact in third.contacts] == ["5"]
+    assert first.has_more is True
+    assert second.has_more is True
+    assert third.has_more is False
+    assert first.next_page_token and first.next_page_token.startswith("c1.")
+    assert all(call["$top"] == contacts._CONTACT_SEARCH_SCAN_PAGE_SIZE for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_search_cursor_is_bound_to_query_and_contact_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummyGraph:
+        async def get(self, path: str, params: dict = None, headers: dict = None):
+            return {
+                "value": [
+                    {"id": "1", "displayName": "Alice", "emailAddresses": []},
+                    {"id": "2", "displayName": "Alice B", "emailAddresses": []},
+                ]
+            }
+
+    monkeypatch.setattr(contacts, "get_graph", lambda _profile: DummyGraph())
+    first = await contacts.search_contacts(
+        contacts.SearchContactsInput(query="Alice", top=1)
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        await contacts.search_contacts(
+            contacts.SearchContactsInput(
+                query="Bob",
+                top=1,
+                skip_token=first.next_page_token,
+            )
+        )
+
+    with pytest.raises(ValueError, match="does not match"):
+        await contacts.list_contacts(
+            contacts.ListContactsInput(
+                folder_id="folder-1",
+                search="Alice",
+                top=1,
+                skip_token=first.next_page_token,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_graph_next_link_outside_expected_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummyGraph:
+        async def get(self, path: str, params: dict = None, headers: dict = None):
+            return {
+                "value": [{"id": "1", "displayName": "Bob", "emailAddresses": []}],
+                "@odata.nextLink": "https://example.com/v1.0/me/contacts?%24skiptoken=x",
+            }
+
+    monkeypatch.setattr(contacts, "get_graph", lambda _profile: DummyGraph())
+    with pytest.raises(ValueError, match="continuation link"):
+        await contacts.search_contacts(contacts.SearchContactsInput(query="Alice"))
+
+
+@pytest.mark.asyncio
+async def test_list_contacts_search_uses_bounded_cursor_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: dict[str, object] = {}
 
     class DummyGraph:
         async def get(self, path: str, params: dict = None, headers: dict = None):
+            captured["path"] = path
             captured["params"] = params
-            return {"value": []}
+            return {
+                "value": [
+                    {"id": "1", "displayName": "O'Reilly", "emailAddresses": []}
+                ]
+            }
 
     monkeypatch.setattr(contacts, "get_graph", lambda _profile: DummyGraph())
-    # Classic OData break-out attempt: close the string and append a tautology.
-    await contacts.search_contacts(contacts.SearchContactsInput(query="x') or (true"))
+    result = await contacts.list_contacts(
+        contacts.ListContactsInput(folder_id="folder-1", search="O'Reilly", top=10)
+    )
 
-    filter_clause = captured["params"]["$filter"]
-    # All literal quotes are doubled, so the apostrophe cannot terminate the string.
-    assert filter_clause == "startswith(displayName,'x'') or (true')"
-    # Sanity: no unbalanced ') sequence that would close the literal prematurely.
-    assert "''" in filter_clause
+    assert captured["path"] == "/me/contactFolders/folder-1/contacts"
+    assert "$filter" not in captured["params"]
+    assert "$search" not in captured["params"]
+    assert [contact.display_name for contact in result.contacts] == ["O'Reilly"]
+    assert result.pages_scanned == 1
+
+
+def test_search_contacts_input_rejects_empty_or_oversized_query() -> None:
+    with pytest.raises(ValueError):
+        contacts.SearchContactsInput(query=" ")
+    with pytest.raises(ValueError):
+        contacts.SearchContactsInput(query="x" * 257)
+    with pytest.raises(ValueError):
+        contacts.ListContactsInput(search=" ")
 
 
 # ---------------------------------------------------------------------------
