@@ -44,6 +44,22 @@ async def test_delete_email_with_confirm_true_and_no_ctx_fails_closed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_email_with_confirm_true_and_no_ctx_fails_closed() -> None:
+    result = await mail.send_email(
+        mail.SendEmailInput(
+            to="recipient@example.com",
+            subject="Test",
+            body="Body",
+            confirm=True,
+        ),
+        ctx=None,
+    )
+
+    assert result.success is False
+    assert "confirm=True requires" in (result.error or "")
+
+
+@pytest.mark.asyncio
 async def test_delete_email_with_confirm_false_still_deletes(monkeypatch: pytest.MonkeyPatch) -> None:
     """When confirm=False the tool should perform the delete without elicitation.
 

@@ -64,6 +64,7 @@ from mcp_microsoft.common.tooling import (
     WRITE_TOOL,
     register_tool,
 )
+from mcp_microsoft.config import get_app_config
 from mcp_microsoft.feature_flags import is_deletion_disabled
 from mcp_microsoft.graph_types import (
     GraphAttachment,
@@ -179,6 +180,20 @@ class SendEmailInput(ToolRequestModel):
     reply_to: str | list[str] | None = None
     profile: str | None = None
     confirm: bool = False
+
+
+class SendEmailHttpInput(ToolRequestModel):
+    """HTTP-safe send input for clients that do not support MCP elicitation."""
+
+    to: str | list[str]
+    subject: str
+    body: str
+    cc: str | list[str] | None = None
+    bcc: str | list[str] | None = None
+    body_type: BodyType = "text"
+    save_to_sent: bool = True
+    reply_to: str | list[str] | None = None
+    profile: str | None = None
 
 
 class ReplyEmailInput(ToolRequestModel):
@@ -701,7 +716,16 @@ async def send_email(
     Returns:
         Structured send confirmation.
     """
-    if params.confirm and ctx:
+    if params.confirm:
+        if ctx is None:
+            return SendEmailResponse(
+                success=False,
+                action="send_email",
+                error=(
+                    "confirm=True requires an MCP host that supports elicitation. "
+                    "The email was not sent."
+                ),
+            )
         to_display = params.to if isinstance(params.to, str) else ", ".join(params.to)
         preview = (
             f"To: {to_display}\n"
@@ -749,6 +773,17 @@ async def send_email(
         subject=params.subject,
         body_type=params.body_type,
         saved_to_sent_items=params.save_to_sent,
+    )
+
+
+async def send_email_http(params: SendEmailHttpInput) -> SendEmailResponse:
+    """Send email over HTTP without advertising unsupported MCP elicitation.
+
+    Remote clients should obtain any user approval before invoking this tool.
+    """
+    return await send_email(
+        SendEmailInput.model_validate(params.model_dump()),
+        ctx=None,
     )
 
 
@@ -1402,7 +1437,10 @@ def register(server) -> None:
     register_tool(server, read_email, annotations=READ_ONLY_TOOL)
     register_tool(server, search_emails, annotations=READ_ONLY_TOOL)
     register_tool(server, filter_emails, annotations=READ_ONLY_TOOL)
-    register_tool(server, send_email, annotations=WRITE_TOOL)
+    if get_app_config().transport == "http":
+        register_tool(server, send_email_http, name="send_email", annotations=WRITE_TOOL)
+    else:
+        register_tool(server, send_email, annotations=WRITE_TOOL)
     register_tool(server, reply_email, annotations=WRITE_TOOL)
     register_tool(server, forward_email, annotations=WRITE_TOOL)
     register_tool(server, mark_as_read, annotations=IDEMPOTENT_WRITE_TOOL)
