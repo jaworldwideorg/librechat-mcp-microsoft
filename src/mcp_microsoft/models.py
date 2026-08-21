@@ -1068,6 +1068,8 @@ class TeamsListMeetingsResponse(MCPModel):
     start_before: str = ""
     count: int = 0
     meetings: list[OnlineMeetingInfo] = Field(default_factory=list)
+    skipped_count: int = 0
+    warnings: list[str] = Field(default_factory=list)
     next_link: str | None = None
 
 

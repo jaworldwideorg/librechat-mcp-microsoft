@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -239,17 +240,19 @@ async def test_teams_list_channels_returns_structured_response(monkeypatch: pyte
 @pytest.mark.asyncio
 async def test_teams_list_channels_uses_team_id_in_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify teams_list_channels builds the correct API path."""
-    captured: dict[str, str] = {}
+    captured: dict[str, object] = {}
 
     class DummyGraph:
         async def get(self, path: str, params: dict = None):
             captured["path"] = path
+            captured["params"] = params
             return {"value": []}
 
     monkeypatch.setattr(teams, "get_graph", lambda _profile: DummyGraph())
     await teams.teams_list_channels(teams.TeamsListChannelsInput(team_id="team-99"))
 
     assert captured["path"] == "/teams/team-99/channels"
+    assert captured["params"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -764,19 +767,28 @@ async def test_teams_list_chats_returns_structured_response(monkeypatch: pytest.
 
 @pytest.mark.asyncio
 async def test_teams_list_chats_filter_by_type(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify teams_list_chats adds $filter param when chat_type is provided."""
-    captured: dict[str, object] = {}
+    """Verify chat type filtering is performed locally across Graph pages."""
+    calls: list[tuple[str, dict[str, object]]] = []
 
     class DummyGraph:
         async def get(self, path: str, params: dict = None):
-            captured["params"] = params or {}
-            return {"value": []}
+            calls.append((path, params or {}))
+            if len(calls) == 1:
+                return {
+                    "value": [{"id": "chat-1", "chatType": "group"}],
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/chats?$skiptoken=next",
+                }
+            return {"value": [{"id": "chat-2", "chatType": "oneOnOne"}]}
 
     monkeypatch.setattr(teams, "get_graph", lambda _profile: DummyGraph())
-    await teams.teams_list_chats(teams.TeamsListChatsInput(chat_type="oneOnOne"))
+    result = await teams.teams_list_chats(
+        teams.TeamsListChatsInput(chat_type="oneOnOne", top=1)
+    )
 
-    assert "$filter" in captured["params"]
-    assert "oneOnOne" in captured["params"]["$filter"]
+    assert "$filter" not in calls[0][1]
+    assert calls[0][1]["$top"] == 50
+    assert calls[1] == ("/me/chats", {"$skiptoken": "next"})
+    assert [chat.id for chat in result.chats] == ["chat-2"]
 
 
 @pytest.mark.asyncio
@@ -1325,6 +1337,50 @@ async def test_teams_list_meetings_empty_result(monkeypatch: pytest.MonkeyPatch)
 
     assert result.count == 0
     assert result.meetings == []
+
+
+@pytest.mark.asyncio
+async def test_teams_list_meetings_skips_inaccessible_calendar_meetings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cross-tenant meeting must not abort the entire enumeration."""
+
+    class DummyGraph:
+        lookup_count = 0
+
+        async def get(self, path: str, params: dict = None):
+            if path == "/me/calendarView":
+                return {
+                    "value": [
+                        {
+                            "id": "event-external",
+                            "isOnlineMeeting": True,
+                            "onlineMeeting": {"joinUrl": "https://teams.example/external"},
+                        },
+                        {
+                            "id": "event-local",
+                            "isOnlineMeeting": True,
+                            "onlineMeeting": {"joinUrl": "https://teams.example/local"},
+                        },
+                    ]
+                }
+            self.lookup_count += 1
+            if self.lookup_count == 1:
+                request = httpx.Request(
+                    "GET", "https://graph.microsoft.com/v1.0/me/onlineMeetings"
+                )
+                response = httpx.Response(403, request=request)
+                raise httpx.HTTPStatusError("Forbidden", request=request, response=response)
+            return {"value": [{"id": "meeting-local", "subject": "Local"}]}
+
+    monkeypatch.setattr(teams, "get_graph", lambda _profile: DummyGraph())
+    result = await teams.teams_list_meetings(teams.TeamsListMeetingsInput())
+
+    assert [meeting.id for meeting in result.meetings] == ["meeting-local"]
+    assert result.skipped_count == 1
+    assert result.warnings == [
+        "Skipped 1 calendar-backed online meeting(s) because Microsoft Graph returned 403."
+    ]
 
 
 # ---------------------------------------------------------------------------
