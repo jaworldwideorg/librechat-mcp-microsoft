@@ -27,6 +27,8 @@ import re
 from typing import Any, Callable, Literal, Optional
 
 from fastmcp.server.context import Context
+from mcp import types as mcp_types
+from mcp.shared.exceptions import McpError
 from pydantic import BaseModel, Field
 
 from mcp_microsoft.common.mail_utils import (
@@ -64,7 +66,6 @@ from mcp_microsoft.common.tooling import (
     WRITE_TOOL,
     register_tool,
 )
-from mcp_microsoft.config import get_app_config
 from mcp_microsoft.feature_flags import is_deletion_disabled
 from mcp_microsoft.graph_types import (
     GraphAttachment,
@@ -83,6 +84,17 @@ from mcp_microsoft.graph import get_graph
 
 class _Confirmation(BaseModel):
     confirmed: bool
+
+
+def _supports_form_elicitation(ctx: Context) -> bool:
+    """Return whether the active MCP session negotiated form elicitation."""
+    try:
+        client_params = ctx.session.client_params
+    except (AttributeError, RuntimeError):
+        return False
+    if client_params is None or client_params.capabilities.elicitation is None:
+        return False
+    return client_params.capabilities.elicitation.form is not None
 
 
 class _BatchRequestEntry(BaseModel):
@@ -180,20 +192,6 @@ class SendEmailInput(ToolRequestModel):
     reply_to: str | list[str] | None = None
     profile: str | None = None
     confirm: bool = False
-
-
-class SendEmailHttpInput(ToolRequestModel):
-    """HTTP-safe send input for clients that do not support MCP elicitation."""
-
-    to: str | list[str]
-    subject: str
-    body: str
-    cc: str | list[str] | None = None
-    bcc: str | list[str] | None = None
-    body_type: BodyType = "text"
-    save_to_sent: bool = True
-    reply_to: str | list[str] | None = None
-    profile: str | None = None
 
 
 class ReplyEmailInput(ToolRequestModel):
@@ -717,12 +715,12 @@ async def send_email(
         Structured send confirmation.
     """
     if params.confirm:
-        if ctx is None:
+        if ctx is None or not _supports_form_elicitation(ctx):
             return SendEmailResponse(
                 success=False,
                 action="send_email",
                 error=(
-                    "confirm=True requires an MCP host that supports elicitation. "
+                    "confirm=True requires an MCP host that negotiated form elicitation. "
                     "The email was not sent."
                 ),
             )
@@ -732,10 +730,22 @@ async def send_email(
             f"Subject: {params.subject}\n\n"
             f"{params.body[:200]}{'...' if len(params.body) > 200 else ''}"
         )
-        result = await ctx.elicit(
-            f"Send this email?\n\n{preview}",
-            response_type=_Confirmation,
-        )
+        try:
+            result = await ctx.elicit(
+                f"Send this email?\n\n{preview}",
+                response_type=_Confirmation,
+            )
+        except McpError as exc:
+            if exc.error.code != mcp_types.METHOD_NOT_FOUND:
+                raise
+            return SendEmailResponse(
+                success=False,
+                action="send_email",
+                error=(
+                    "The MCP client advertised elicitation but did not implement it. "
+                    "The email was not sent."
+                ),
+            )
         if result.action != "accept" or not result.data.confirmed:
             return SendEmailResponse(success=False, action="send_email", error="Cancelled by user.")
 
@@ -773,17 +783,6 @@ async def send_email(
         subject=params.subject,
         body_type=params.body_type,
         saved_to_sent_items=params.save_to_sent,
-    )
-
-
-async def send_email_http(params: SendEmailHttpInput) -> SendEmailResponse:
-    """Send email over HTTP without advertising unsupported MCP elicitation.
-
-    Remote clients should obtain any user approval before invoking this tool.
-    """
-    return await send_email(
-        SendEmailInput.model_validate(params.model_dump()),
-        ctx=None,
     )
 
 
@@ -1437,10 +1436,7 @@ def register(server) -> None:
     register_tool(server, read_email, annotations=READ_ONLY_TOOL)
     register_tool(server, search_emails, annotations=READ_ONLY_TOOL)
     register_tool(server, filter_emails, annotations=READ_ONLY_TOOL)
-    if get_app_config().transport == "http":
-        register_tool(server, send_email_http, name="send_email", annotations=WRITE_TOOL)
-    else:
-        register_tool(server, send_email, annotations=WRITE_TOOL)
+    register_tool(server, send_email, annotations=WRITE_TOOL)
     register_tool(server, reply_email, annotations=WRITE_TOOL)
     register_tool(server, forward_email, annotations=WRITE_TOOL)
     register_tool(server, mark_as_read, annotations=IDEMPOTENT_WRITE_TOOL)

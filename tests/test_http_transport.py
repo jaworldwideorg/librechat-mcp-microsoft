@@ -916,14 +916,13 @@ async def test_download_attachment_http_schema_omits_save_path(
 
 
 @pytest.mark.asyncio
-async def test_send_email_http_schema_omits_elicitation_confirmation(
+async def test_send_email_http_schema_preserves_elicitation_confirmation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from fastmcp import FastMCP
 
     from mcp_microsoft.tools import mail
 
-    monkeypatch.setattr(mail, "get_app_config", lambda: AppConfig(transport="http"))
     mcp = FastMCP("test-server")
     mail.register(mcp)
 
@@ -932,35 +931,9 @@ async def test_send_email_http_schema_omits_elicitation_confirmation(
         for tool in await mcp.list_tools(run_middleware=False)
         if tool.name == "send_email"
     )
-    input_properties = tool.parameters["$defs"]["SendEmailHttpInput"]["properties"]
+    input_properties = tool.parameters["$defs"]["SendEmailInput"]["properties"]
 
-    assert "confirm" not in input_properties
-
-
-@pytest.mark.asyncio
-async def test_send_email_http_posts_without_elicitation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from mcp_microsoft.tools import mail
-
-    captured: dict[str, object] = {}
-
-    class DummyGraph:
-        async def post(self, path: str, json: dict | None = None):
-            captured["path"] = path
-            captured["json"] = json
-
-    monkeypatch.setattr(mail, "get_graph", lambda _profile: DummyGraph())
-    result = await mail.send_email_http(
-        mail.SendEmailHttpInput(
-            to="recipient@example.com",
-            subject="Test",
-            body="Body",
-        )
-    )
-
-    assert result.success is True
-    assert captured["path"] == "/me/sendMail"
+    assert "confirm" in input_properties
 
 
 @pytest.mark.asyncio

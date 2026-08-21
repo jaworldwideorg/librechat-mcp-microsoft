@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import multiprocessing
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -32,6 +34,14 @@ from mcp_microsoft.models import (
     ReadAttachmentResponse,
 )
 from mcp_microsoft.graph import get_graph
+
+_MAX_READABLE_ATTACHMENT_BYTES = 10 * 1024 * 1024
+_MAX_PDF_PAGES = 100
+_MAX_PDF_PAGE_STREAM_BYTES = 8 * 1024 * 1024
+_MAX_PDF_TOTAL_STREAM_BYTES = 32 * 1024 * 1024
+_PDF_WORKER_MEMORY_BYTES = 512 * 1024 * 1024
+_PDF_WORKER_CPU_SECONDS = 10
+_PDF_WORKER_WALL_SECONDS = 15
 
 # ---------------------------------------------------------------------------
 # list_attachments
@@ -64,12 +74,113 @@ class ReadAttachmentInput(ToolRequestModel):
     profile: str | None = None
 
 
-def _extract_pdf_text(raw_bytes: bytes) -> tuple[str, int]:
-    """Extract PDF text synchronously; callers run this outside the event loop."""
-    reader = PdfReader(io.BytesIO(raw_bytes))
-    return "\n\n".join(page.extract_text() or "" for page in reader.pages), len(
-        reader.pages
+def _apply_pdf_worker_limits() -> None:
+    """Apply process resource limits where the operating system supports them."""
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - Windows has no resource module
+        return
+
+    resource.setrlimit(
+        resource.RLIMIT_CPU,
+        (_PDF_WORKER_CPU_SECONDS, _PDF_WORKER_CPU_SECONDS + 1),
     )
+    if sys.platform.startswith("linux"):
+        resource.setrlimit(
+            resource.RLIMIT_AS,
+            (_PDF_WORKER_MEMORY_BYTES, _PDF_WORKER_MEMORY_BYTES),
+        )
+
+
+def _extract_pdf_text_bounded(
+    raw_bytes: bytes, max_characters: int
+) -> tuple[str, int, bool]:
+    """Extract PDF text while enforcing page and decoded stream budgets."""
+    reader = PdfReader(io.BytesIO(raw_bytes))
+    page_count = len(reader.pages)
+    if page_count > _MAX_PDF_PAGES:
+        raise ValueError(f"PDF exceeds the {_MAX_PDF_PAGES}-page extraction limit.")
+
+    parts: list[str] = []
+    character_count = 0
+    total_stream_bytes = 0
+    truncated = False
+    for page in reader.pages:
+        contents = page.get_contents()
+        stream_size = len(contents.get_data()) if contents is not None else 0
+        if stream_size > _MAX_PDF_PAGE_STREAM_BYTES:
+            raise ValueError("A PDF page exceeds the decoded content-stream limit.")
+        total_stream_bytes += stream_size
+        if total_stream_bytes > _MAX_PDF_TOTAL_STREAM_BYTES:
+            raise ValueError("PDF exceeds the total decoded content-stream limit.")
+
+        page_text = page.extract_text() or ""
+        separator = "\n\n" if parts else ""
+        remaining = max_characters + 1 - character_count
+        addition = (separator + page_text)[:remaining]
+        parts.append(addition)
+        character_count += len(addition)
+        if character_count > max_characters:
+            truncated = True
+            break
+
+    text = "".join(parts)
+    return text[:max_characters], page_count, truncated
+
+
+def _pdf_worker(send_conn, raw_bytes: bytes, max_characters: int) -> None:
+    """Run bounded PDF extraction in an isolated child process."""
+    try:
+        _apply_pdf_worker_limits()
+        send_conn.send(("ok", _extract_pdf_text_bounded(raw_bytes, max_characters)))
+    except BaseException as exc:
+        send_conn.send(("error", str(exc) or type(exc).__name__))
+    finally:
+        send_conn.close()
+
+
+def _extract_pdf_text_isolated(
+    raw_bytes: bytes, max_characters: int
+) -> tuple[str, int, bool]:
+    """Extract PDF text in a disposable spawned process with a wall-time limit."""
+    context = multiprocessing.get_context("spawn")
+    receive_conn, send_conn = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_pdf_worker,
+        args=(send_conn, raw_bytes, max_characters),
+        daemon=True,
+    )
+    process.start()
+    send_conn.close()
+    try:
+        if not receive_conn.poll(_PDF_WORKER_WALL_SECONDS):
+            process.terminate()
+            process.join(timeout=1)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1)
+            raise TimeoutError(
+                f"PDF extraction exceeded the {_PDF_WORKER_WALL_SECONDS}-second limit."
+            )
+        try:
+            status, payload = receive_conn.recv()
+        except EOFError as exc:
+            raise RuntimeError("PDF extraction worker exceeded a resource limit.") from exc
+        process.join(timeout=1)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=1)
+        if status == "error":
+            raise ValueError(payload)
+        return payload
+    finally:
+        receive_conn.close()
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=1)
+        close_process = getattr(process, "close", None)
+        if close_process is not None:
+            close_process()
 
 
 async def list_attachments(params: ListAttachmentsInput) -> ListAttachmentsResponse:
@@ -238,28 +349,54 @@ async def read_attachment(params: ReadAttachmentInput) -> ReadAttachmentResponse
         Extracted attachment text and PDF page count when applicable.
     """
     g = get_graph(params.profile)
-    attachment = GraphAttachment.model_validate(
+    attachment_path = (
+        f"/me/messages/{params.message_id}/attachments/{params.attachment_id}"
+    )
+    metadata = GraphAttachment.model_validate(
         await g.get(
-            f"/me/messages/{params.message_id}/attachments/{params.attachment_id}"
+            attachment_path,
+            params={"$select": "id,name,size,contentType,isInline"},
         )
         or {}
     )
+    if metadata.size > _MAX_READABLE_ATTACHMENT_BYTES:
+        raise ToolError("Attachment exceeds the 10 MiB text-extraction limit.")
+
+    attachment = GraphAttachment.model_validate(
+        await g.get(attachment_path) or {}
+    )
     if attachment.content_bytes is None:
         raise ToolError("Attachment has no readable file content.")
+
+    max_encoded_size = ((_MAX_READABLE_ATTACHMENT_BYTES + 2) // 3) * 4
+    if len(attachment.content_bytes) > max_encoded_size:
+        raise ToolError("Attachment exceeds the 10 MiB text-extraction limit.")
 
     try:
         raw_bytes = base64.b64decode(attachment.content_bytes, validate=True)
     except (ValueError, TypeError) as exc:
         raise ToolError("Attachment content returned by Microsoft Graph is invalid.") from exc
 
-    content_type = (attachment.content_type or "").casefold()
+    if len(raw_bytes) > _MAX_READABLE_ATTACHMENT_BYTES:
+        raise ToolError("Attachment exceeds the 10 MiB text-extraction limit.")
+
+    content_type = (attachment.content_type or metadata.content_type or "").casefold()
     suffix = Path(attachment.name).suffix.casefold()
     page_count = 0
+    limit = min(max(1, params.max_characters), 100_000)
     if content_type == "application/pdf" or suffix == ".pdf":
         try:
-            text, page_count = await asyncio.to_thread(_extract_pdf_text, raw_bytes)
+            text, page_count, truncated = await asyncio.to_thread(
+                _extract_pdf_text_isolated, raw_bytes, limit
+            )
+        except TimeoutError as exc:
+            raise ToolError(str(exc)) from exc
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
         except Exception as exc:
-            raise ToolError("Unable to extract text from this PDF attachment.") from exc
+            raise ToolError(
+                "Unable to extract text from this PDF attachment within safe resource limits."
+            ) from exc
         if not text.strip():
             raise ToolError(
                 "This PDF contains no extractable text; it may be scanned or image-only."
@@ -276,14 +413,13 @@ async def read_attachment(params: ReadAttachmentInput) -> ReadAttachmentResponse
             text = raw_bytes.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
             raise ToolError("Unable to decode this text attachment as UTF-8.") from exc
+        truncated = len(text) > limit
     else:
         raise ToolError(
             "Text extraction currently supports PDF and plain-text attachments; "
             "use download_attachment to retrieve other file types."
         )
 
-    limit = min(max(1, params.max_characters), 100_000)
-    truncated = len(text) > limit
     return ReadAttachmentResponse(
         message_id=params.message_id,
         attachment_id=params.attachment_id,

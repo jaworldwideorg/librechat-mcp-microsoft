@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from mcp import types as mcp_types
+from mcp.shared.exceptions import McpError
 
 from mcp_microsoft.config import reset_app_config
 from mcp_microsoft.runtime import reset_runtime_state
@@ -57,6 +59,119 @@ async def test_send_email_with_confirm_true_and_no_ctx_fails_closed() -> None:
 
     assert result.success is False
     assert "confirm=True requires" in (result.error or "")
+
+
+class _EmailConfirmationContext:
+    def __init__(self, *, supported: bool, result=None, error: Exception | None = None):
+        elicitation = None
+        if supported:
+            elicitation = SimpleNamespace(form=SimpleNamespace())
+        capabilities = SimpleNamespace(elicitation=elicitation)
+        self.session = SimpleNamespace(
+            client_params=SimpleNamespace(capabilities=capabilities)
+        )
+        self.result = result or SimpleNamespace(
+            action="accept", data=SimpleNamespace(confirmed=True)
+        )
+        self.error = error
+
+    async def elicit(self, _prompt: str, response_type):
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_send_email_confirm_requires_negotiated_form_elicitation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        mail,
+        "get_graph",
+        lambda _profile: (_ for _ in ()).throw(AssertionError("Graph must not be called")),
+    )
+
+    result = await mail.send_email(
+        mail.SendEmailInput(
+            to="recipient@example.com", subject="Test", body="Body", confirm=True
+        ),
+        ctx=_EmailConfirmationContext(supported=False),
+    )
+
+    assert result.success is False
+    assert "negotiated form elicitation" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_send_email_confirm_handles_false_capability_advertisement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        mail,
+        "get_graph",
+        lambda _profile: (_ for _ in ()).throw(AssertionError("Graph must not be called")),
+    )
+    error = McpError(
+        mcp_types.ErrorData(
+            code=mcp_types.METHOD_NOT_FOUND,
+            message="Method not found",
+        )
+    )
+
+    result = await mail.send_email(
+        mail.SendEmailInput(
+            to="recipient@example.com", subject="Test", body="Body", confirm=True
+        ),
+        ctx=_EmailConfirmationContext(supported=True, error=error),
+    )
+
+    assert result.success is False
+    assert "advertised elicitation" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_send_email_confirm_sends_after_acceptance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class DummyGraph:
+        async def post(self, path: str, json: dict | None = None):
+            captured["path"] = path
+
+    monkeypatch.setattr(mail, "get_graph", lambda _profile: DummyGraph())
+    result = await mail.send_email(
+        mail.SendEmailInput(
+            to="recipient@example.com", subject="Test", body="Body", confirm=True
+        ),
+        ctx=_EmailConfirmationContext(supported=True),
+    )
+
+    assert result.success is True
+    assert captured["path"] == "/me/sendMail"
+
+
+@pytest.mark.asyncio
+async def test_send_email_confirm_cancellation_does_not_call_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        mail,
+        "get_graph",
+        lambda _profile: (_ for _ in ()).throw(AssertionError("Graph must not be called")),
+    )
+    cancelled = SimpleNamespace(
+        action="cancel", data=SimpleNamespace(confirmed=False)
+    )
+    result = await mail.send_email(
+        mail.SendEmailInput(
+            to="recipient@example.com", subject="Test", body="Body", confirm=True
+        ),
+        ctx=_EmailConfirmationContext(supported=True, result=cancelled),
+    )
+
+    assert result.success is False
+    assert result.error == "Cancelled by user."
 
 
 @pytest.mark.asyncio

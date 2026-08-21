@@ -61,26 +61,25 @@ async def test_download_attachment_returns_fastmcp_file(monkeypatch: pytest.Monk
 @pytest.mark.asyncio
 async def test_read_attachment_extracts_pdf_text(monkeypatch: pytest.MonkeyPatch) -> None:
     class DummyGraph:
-        async def get(self, _path: str):
+        async def get(self, _path: str, params: dict | None = None):
+            if params is not None:
+                return {
+                    "name": "report.pdf",
+                    "contentType": "application/pdf",
+                    "size": 9,
+                }
             return {
                 "name": "report.pdf",
                 "contentType": "application/pdf",
                 "contentBytes": base64.b64encode(b"pdf bytes").decode("ascii"),
             }
 
-    class DummyPage:
-        def __init__(self, text: str) -> None:
-            self.text = text
-
-        def extract_text(self) -> str:
-            return self.text
-
-    class DummyReader:
-        def __init__(self, _stream) -> None:
-            self.pages = [DummyPage("Page one"), DummyPage("Page two")]
-
     monkeypatch.setattr(attachments, "get_graph", lambda _profile: DummyGraph())
-    monkeypatch.setattr(attachments, "PdfReader", DummyReader)
+    monkeypatch.setattr(
+        attachments,
+        "_extract_pdf_text_isolated",
+        lambda _raw, _limit: ("Page one\n\nPage two", 2, False),
+    )
 
     result = await attachments.read_attachment(
         attachments.ReadAttachmentInput(
@@ -98,7 +97,13 @@ async def test_read_attachment_extracts_pdf_text(monkeypatch: pytest.MonkeyPatch
 @pytest.mark.asyncio
 async def test_read_attachment_truncates_text(monkeypatch: pytest.MonkeyPatch) -> None:
     class DummyGraph:
-        async def get(self, _path: str):
+        async def get(self, _path: str, params: dict | None = None):
+            if params is not None:
+                return {
+                    "name": "notes.txt",
+                    "contentType": "text/plain",
+                    "size": 8,
+                }
             return {
                 "name": "notes.txt",
                 "contentType": "text/plain",
