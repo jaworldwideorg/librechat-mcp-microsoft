@@ -306,46 +306,43 @@ async def test_list_contact_folders_returns_structured_response(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_search_contacts_matches_names_and_emails_locally(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The contacts endpoint does not support search; matching is done locally."""
+async def test_search_contacts_uses_startswith_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify search_contacts uses OData $filter with startswith."""
     captured: dict[str, object] = {}
 
     class DummyGraph:
         async def get(self, path: str, params: dict = None, headers: dict = None):
             captured["params"] = params
-            return {
-                "value": [
-                    {"id": "1", "displayName": "Alice Jones", "emailAddresses": []},
-                    {"id": "2", "displayName": "Bob Jones", "emailAddresses": [{"address": "alice@example.com"}]},
-                    {"id": "3", "displayName": "Carol Smith", "emailAddresses": []},
-                ]
-            }
+            return {"value": []}
 
     monkeypatch.setattr(contacts, "get_graph", lambda _profile: DummyGraph())
-    result = await contacts.search_contacts(contacts.SearchContactsInput(query="Alice"))
+    await contacts.search_contacts(contacts.SearchContactsInput(query="Alice"))
 
-    assert "$filter" not in captured["params"]
-    assert [contact.id for contact in result.contacts] == ["1", "2"]
+    assert "$filter" in captured["params"]
+    assert "startswith(displayName,'Alice')" in captured["params"]["$filter"]
 
 
 @pytest.mark.asyncio
-async def test_search_contacts_treats_quotes_as_plain_text(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_search_contacts_escapes_quotes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify search_contacts doubles single quotes per the OData escape rule."""
     captured: dict[str, object] = {}
 
     class DummyGraph:
         async def get(self, path: str, params: dict = None, headers: dict = None):
             captured["params"] = params
-            return {"value": [{"id": "1", "displayName": "O'Reilly", "emailAddresses": []}]}
+            return {"value": []}
 
     monkeypatch.setattr(contacts, "get_graph", lambda _profile: DummyGraph())
-    result = await contacts.search_contacts(contacts.SearchContactsInput(query="O'Reilly"))
+    await contacts.search_contacts(contacts.SearchContactsInput(query="O'Reilly"))
 
-    assert "$filter" not in captured["params"]
-    assert [contact.display_name for contact in result.contacts] == ["O'Reilly"]
+    # Quote-doubling produces a syntactically valid OData literal that
+    # preserves the apostrophe rather than silently mangling user input.
+    assert "startswith(displayName,'O''Reilly')" in captured["params"]["$filter"]
 
 
 @pytest.mark.asyncio
-async def test_search_contacts_does_not_send_query_as_odata(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_search_contacts_injection_cannot_escape_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify a probe attempting to break out of the literal stays contained."""
     captured: dict[str, object] = {}
 
     class DummyGraph:
@@ -357,7 +354,11 @@ async def test_search_contacts_does_not_send_query_as_odata(monkeypatch: pytest.
     # Classic OData break-out attempt: close the string and append a tautology.
     await contacts.search_contacts(contacts.SearchContactsInput(query="x') or (true"))
 
-    assert "$filter" not in captured["params"]
+    filter_clause = captured["params"]["$filter"]
+    # All literal quotes are doubled, so the apostrophe cannot terminate the string.
+    assert filter_clause == "startswith(displayName,'x'') or (true')"
+    # Sanity: no unbalanced ') sequence that would close the literal prematurely.
+    assert "''" in filter_clause
 
 
 # ---------------------------------------------------------------------------

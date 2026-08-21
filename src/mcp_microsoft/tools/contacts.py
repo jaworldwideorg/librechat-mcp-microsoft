@@ -152,39 +152,6 @@ def _normalize_contact(c: GraphContact | dict[str, Any]) -> ContactInfo:
     )
 
 
-def _contact_matches(contact: GraphContact, query: str) -> bool:
-    """Match a contact locally because the contacts API has no $search support."""
-    needle = query.casefold()
-    values = [contact.display_name, contact.given_name, contact.surname]
-    values.extend(address.address for address in contact.email_addresses)
-    values.extend(address.name for address in contact.email_addresses)
-    return any(needle in (value or "").casefold() for value in values)
-
-
-async def _fetch_all_contacts(g: Any, path: str) -> list[GraphContact]:
-    """Fetch contact pages without relying on unsupported search/filter syntax."""
-    contacts: list[GraphContact] = []
-    next_path = path
-    query: dict[str, Any] | None = {"$select": _CONTACT_SELECT, "$top": 100}
-    seen_links: set[str] = set()
-
-    while next_path:
-        result = await g.get(next_path, params=query)
-        contacts.extend(parse_graph_collection(result or {}, GraphContact))
-        next_link = (result or {}).get("@odata.nextLink", "")
-        if not next_link or next_link in seen_links:
-            break
-        seen_links.add(next_link)
-        parsed = urlparse(next_link)
-        marker = "/v1.0"
-        next_path = parsed.path.split(marker, 1)[-1]
-        if parsed.query:
-            next_path = f"{next_path}?{parsed.query}"
-        query = None
-
-    return contacts
-
-
 # ---------------------------------------------------------------------------
 # list_contacts
 # ---------------------------------------------------------------------------
@@ -197,8 +164,7 @@ async def list_contacts(params: ListContactsInput) -> ListContactsResponse:
     Args:
         top: Maximum number of contacts to return (1-100). Defaults to 25.
         folder_id: Optional contact folder ID. Omit to use the default contacts folder.
-        search: Optional case-insensitive text matched locally against contact
-            names and email addresses.
+        search: Optional Graph `$search` expression for server-side search.
         skip_token: Pagination cursor returned by a previous call.
         profile: Microsoft 365 profile to use. Omit to use the default profile.
 
@@ -218,26 +184,24 @@ async def list_contacts(params: ListContactsInput) -> ListContactsResponse:
     if params.skip_token is not None:
         query["$skiptoken"] = params.skip_token
 
+    extra_headers: dict[str, str] | None = None
     if params.search:
+        # Reject control characters and cap length — $search is a free-text term,
+        # not a $filter expression, but degenerate input still produces noisy queries.
         raw_search = params.search
         if any(ord(c) < 0x20 for c in raw_search) or len(raw_search) > 256:
             raise ValueError("search must be ≤256 printable characters")
+        # $search requires ConsistencyLevel: eventual
+        query["$search"] = raw_search
+        extra_headers = {"ConsistencyLevel": "eventual"}
 
     if params.folder_id:
         path = f"/me/contactFolders/{params.folder_id}/contacts"
     else:
         path = "/me/contacts"
 
-    if params.search:
-        contacts = await _fetch_all_contacts(g, path)
-        contacts = sorted(
-            (contact for contact in contacts if _contact_matches(contact, params.search)),
-            key=lambda contact: contact.display_name.casefold(),
-        )[:top]
-        result: dict[str, Any] = {"value": []}
-    else:
-        result = await g.get(path, params=query)
-        contacts = parse_graph_collection(result or {}, GraphContact)
+    result = await g.get(path, params=query, headers=extra_headers)
+    contacts = parse_graph_collection(result or {}, GraphContact)
 
     next_link = (result or {}).get("@odata.nextLink", "")
     next_page_token: str | None = None
@@ -527,15 +491,24 @@ async def search_contacts(params: SearchContactsInput) -> SearchContactsResponse
         profile: Microsoft 365 profile to use. Omit to use the default profile.
 
     Returns:
-        Contacts whose names or email addresses contain the given query.
+        Contacts whose displayName starts with the given query.
     """
-    top = max(1, min(params.top, 100))
     g = get_graph(params.profile)
-    contacts = await _fetch_all_contacts(g, "/me/contacts")
-    contacts = sorted(
-        (contact for contact in contacts if _contact_matches(contact, params.query)),
-        key=lambda contact: contact.display_name.casefold(),
-    )[:top]
+    top = max(1, min(params.top, 100))
+
+    # Escape single quotes by doubling (OData literal-string convention) to
+    # prevent injection via the $filter clause below.
+    safe_query = params.query.replace("'", "''")
+
+    query_params: dict[str, Any] = {
+        "$select": _CONTACT_SELECT,
+        "$filter": f"startswith(displayName,'{safe_query}')",
+        "$top": top,
+        "$orderby": "displayName",
+    }
+
+    result = await g.get("/me/contacts", params=query_params)
+    contacts = parse_graph_collection(result or {}, GraphContact)
 
     return SearchContactsResponse(
         query=params.query,
