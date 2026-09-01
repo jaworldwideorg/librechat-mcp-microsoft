@@ -162,6 +162,25 @@ async def test_create_reply_draft_schema_and_annotations() -> None:
 
 
 @pytest.mark.asyncio
+async def test_update_draft_schema_documents_history_preservation() -> None:
+    mcp = FastMCP("test-server")
+    drafts.register(mcp)
+
+    tools = {tool.name: tool for tool in await mcp.list_tools(run_middleware=False)}
+    tool = tools["update_draft"]
+    params_schema = _inner_params_schema(tool)
+
+    assert params_schema["required"] == ["draft_id"]
+    preserve_schema = params_schema["properties"]["preserve_history"]
+    assert preserve_schema["default"] is False
+    assert "quoted reply history is retained" in preserve_schema["description"]
+    assert tool.annotations.destructiveHint is False
+    assert tool.annotations.openWorldHint is True
+    assert "does not send" in tool.description
+    assert "Mail.ReadWrite" in tool.description
+
+
+@pytest.mark.asyncio
 async def test_move_or_copy_item_tool_preserves_copy_field_name() -> None:
     mcp = FastMCP("test-server")
     onedrive.register(mcp)

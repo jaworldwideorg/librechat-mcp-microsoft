@@ -14,6 +14,8 @@ Implemented:
 
 from __future__ import annotations
 
+import html
+import re
 from typing import Literal
 
 import httpx
@@ -92,6 +94,14 @@ class UpdateDraftInput(ToolRequestModel):
     to: str | list[str] | None = None
     cc: str | list[str] | None = None
     body_type: BodyType = "text"
+    preserve_history: bool = Field(
+        default=False,
+        description=(
+            "When true and body is provided, prepend the new body to the draft's "
+            "existing body so quoted reply history is retained. When false, body "
+            "replaces the complete draft body."
+        ),
+    )
     profile: str | None = None
 
 
@@ -325,19 +335,63 @@ async def get_draft(params: GetDraftInput) -> DraftDetailResponse:
 # ---------------------------------------------------------------------------
 
 
+_BODY_OPEN_TAG = re.compile(r"(<body(?:\s[^>]*)?>)", re.IGNORECASE)
+
+
+def _text_to_html_fragment(value: str) -> str:
+    """Convert caller-supplied plain text to a safe HTML fragment."""
+    escaped = html.escape(value).replace("\r\n", "\n").replace("\r", "\n")
+    return f"<div>{escaped.replace(chr(10), '<br>')}</div>"
+
+
+def _prepend_draft_body(
+    *,
+    new_body: str,
+    new_body_type: BodyType,
+    existing_body: str,
+    existing_body_type: str,
+) -> str:
+    """Prepend new content while keeping the complete existing draft body."""
+    new_fragment = (
+        new_body if new_body_type == "html" else _text_to_html_fragment(new_body)
+    )
+    existing_html = (
+        existing_body
+        if existing_body_type.lower() == "html"
+        else _text_to_html_fragment(existing_body)
+    )
+    insertion = f"{new_fragment}<br><br>"
+    if match := _BODY_OPEN_TAG.search(existing_html):
+        return (
+            existing_html[: match.end()]
+            + insertion
+            + existing_html[match.end() :]
+        )
+    return insertion + existing_html
+
+
 async def update_draft(
     params: UpdateDraftInput,
 ) -> UpdateDraftResponse:
     """
     Update an existing email draft. Only provided fields are changed.
 
+    By default, a supplied body replaces the complete draft body. Set
+    preserve_history to prepend the new body while retaining the existing
+    content, including quoted reply history. This tool does not send the
+    draft. Requires the delegated Microsoft Graph ``Mail.ReadWrite``
+    permission.
+
     Args:
         draft_id: The Graph message ID of the draft to update.
         subject: Replace subject line (omit to leave unchanged).
-        body: Replace body content (omit to leave unchanged).
+        body: Body content to replace or prepend (omit to leave unchanged).
         to: Replace recipient list (omit to leave unchanged).
         cc: Replace CC list (omit to leave unchanged).
         body_type: 'text' or 'html'. Only used when body is provided. Defaults to 'text'.
+        preserve_history: When True, prepend body to the existing complete body
+            so quoted reply history is retained. Defaults to False, which
+            preserves the existing full-body replacement behavior.
         profile: Microsoft 365 profile to use. Omit to use the default profile.
 
     Returns:
@@ -349,10 +403,35 @@ async def update_draft(
     if params.subject is not None:
         patch["subject"] = params.subject
     if params.body is not None:
-        patch["body"] = {
-            "contentType": "HTML" if params.body_type.lower() == "html" else "Text",
-            "content": params.body,
-        }
+        if params.preserve_history:
+            raw_draft = await g.get(
+                f"/me/messages/{params.draft_id}",
+                params={"$select": "id,isDraft,body"},
+                headers={"Prefer": 'outlook.body-content-type="html"'},
+            )
+            current = GraphMessage.model_validate(raw_draft or {})
+            if not current.id or not current.is_draft:
+                return UpdateDraftResponse(
+                    success=False,
+                    action="update_draft",
+                    draft_id=params.draft_id,
+                    updated_fields=[],
+                    error="Microsoft Graph did not return a valid draft to update.",
+                )
+            patch["body"] = {
+                "contentType": "HTML",
+                "content": _prepend_draft_body(
+                    new_body=params.body,
+                    new_body_type=params.body_type,
+                    existing_body=current.body.content or "",
+                    existing_body_type=current.body.content_type or "html",
+                ),
+            }
+        else:
+            patch["body"] = {
+                "contentType": "HTML" if params.body_type.lower() == "html" else "Text",
+                "content": params.body,
+            }
     if params.to is not None:
         patch["toRecipients"] = parse_recipients(params.to)
     if params.cc is not None:

@@ -40,7 +40,7 @@ The server ships as an MCPB bundle (`mcp-microsoft.mcpb`) for zero-friction inst
 - `bulk_move_emails` — move multiple messages to a folder in one operation
 - `bulk_trash_emails` — move multiple messages to Deleted Items
 - `bulk_delete_emails` — permanently delete multiple messages (irreversible)
-- `create_draft` / `create_reply_draft` / `get_draft` / `list_drafts` / `update_draft` / `send_draft` — full draft lifecycle, including reply and reply-all drafts that retain quoted conversation history
+- `create_draft` / `create_reply_draft` / `get_draft` / `list_drafts` / `update_draft` / `send_draft` — full draft lifecycle, including reply and reply-all drafts whose history can be retained during body updates with `preserve_history=true`
 - `list_folders` / `create_folder` / `delete_folder` — manage mailbox folders
 - `list_attachments` / `download_attachment` — inspect and save attachments
 

@@ -506,6 +506,79 @@ async def test_update_draft_patches_subject_and_body(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
+async def test_update_draft_can_prepend_body_and_preserve_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """History-preserving updates fetch and retain the complete current body."""
+    captured: dict[str, object] = {}
+
+    class DummyGraph:
+        async def get(self, path: str, params: dict = None, headers: dict = None):
+            captured["get"] = (path, params, headers)
+            return {
+                "id": "reply-draft",
+                "isDraft": True,
+                "body": {
+                    "contentType": "html",
+                    "content": "<html><body><div id='quoted'>Original history</div></body></html>",
+                },
+            }
+
+        async def patch(self, path: str, json: dict = None):
+            captured["patch"] = (path, json)
+            return {"id": "reply-draft"}
+
+    monkeypatch.setattr(drafts, "get_graph", lambda _profile: DummyGraph())
+    result = await drafts.update_draft(
+        drafts.UpdateDraftInput(
+            draft_id="reply-draft",
+            body="Thanks <team>\nI will review this.",
+            preserve_history=True,
+        )
+    )
+
+    assert result.success is True
+    assert captured["get"] == (
+        "/me/messages/reply-draft",
+        {"$select": "id,isDraft,body"},
+        {"Prefer": 'outlook.body-content-type="html"'},
+    )
+    patch_path, patch_json = captured["patch"]
+    assert patch_path == "/me/messages/reply-draft"
+    assert patch_json["body"]["contentType"] == "HTML"
+    content = patch_json["body"]["content"]
+    assert content.startswith("<html><body><div>Thanks &lt;team&gt;<br>I will review this.</div>")
+    assert "<div id='quoted'>Original history</div>" in content
+
+
+@pytest.mark.asyncio
+async def test_update_draft_preserve_history_fails_closed_for_invalid_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not PATCH when Graph does not return an existing draft."""
+
+    class DummyGraph:
+        async def get(self, path: str, params: dict = None, headers: dict = None):
+            return {"id": "sent-message", "isDraft": False}
+
+        async def patch(self, path: str, json: dict = None):
+            pytest.fail("PATCH must not be called for a non-draft message")
+
+    monkeypatch.setattr(drafts, "get_graph", lambda _profile: DummyGraph())
+    result = await drafts.update_draft(
+        drafts.UpdateDraftInput(
+            draft_id="sent-message",
+            body="Do not apply",
+            preserve_history=True,
+        )
+    )
+
+    assert result.success is False
+    assert result.updated_fields == []
+    assert result.error == "Microsoft Graph did not return a valid draft to update."
+
+
+@pytest.mark.asyncio
 async def test_update_draft_updates_recipients(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify update_draft updates toRecipients and ccRecipients when provided."""
     captured: dict[str, object] = {}
